@@ -28,6 +28,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Windows consoles often default stdout to a legacy code page (cp1252) that
+# can't encode characters like the arrows used in this file's log messages
+# or accented transcript text. Force UTF-8 so prints don't crash mid-render.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8")
+
 try:
     from grade import get_preset, auto_grade_for_clip  # same directory
 except Exception:
@@ -131,8 +138,44 @@ def is_hdr_source(video: Path) -> bool:
         return False
 
 
+def get_video_dims(video: Path) -> tuple[int, int]:
+    """Return (width, height) as DISPLAYED (post-rotation) — swaps coded dims
+    when a +/-90 degree rotation side-data tag is present, same detection
+    `is_portrait_source` uses below."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height",
+         "-of", "csv=p=0", str(video)],
+        capture_output=True, text=True, check=True,
+    )
+    w_str, h_str = [p for p in out.stdout.strip().split(",") if p][:2]
+    w, h = int(w_str), int(h_str)
+
+    rot_out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream_side_data=rotation",
+         "-of", "csv=p=0", str(video)],
+        capture_output=True, text=True, check=True,
+    )
+    rotation_text = rot_out.stdout.strip().strip(",")
+    if rotation_text:
+        try:
+            rotation = int(float(rotation_text.splitlines()[0]))
+            if rotation % 180 != 0:
+                w, h = h, w
+        except ValueError:
+            pass
+    return w, h
+
+
 def is_portrait_source(video: Path) -> bool:
-    """Return True if the video's height > width (portrait / vertical)."""
+    """Return True if the video displays portrait / vertical.
+
+    Checks coded width/height, then flips the verdict if a +/-90 degree
+    rotation side-data (Display Matrix) is present — common on phone/gimbal
+    footage that stores landscape-coded frames with a rotation tag so the
+    player displays them upright as portrait.
+    """
     try:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -140,10 +183,66 @@ def is_portrait_source(video: Path) -> bool:
              "-of", "csv=p=0", str(video)],
             capture_output=True, text=True, check=True,
         )
-        w, h = map(int, out.stdout.strip().split(","))
-        return h > w
+        w_str, h_str = [p for p in out.stdout.strip().split(",") if p][:2]
+        w, h = int(w_str), int(h_str)
+        portrait = h > w
+
+        rot_out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream_side_data=rotation",
+             "-of", "csv=p=0", str(video)],
+            capture_output=True, text=True, check=True,
+        )
+        rotation_text = rot_out.stdout.strip().strip(",")
+        if rotation_text:
+            try:
+                rotation = int(float(rotation_text.splitlines()[0]))
+                if rotation % 180 != 0:
+                    portrait = not portrait
+            except ValueError:
+                pass
+        return portrait
     except Exception:
         return False
+
+
+# -------- Ken Burns push in/out ----------------------------------------------
+#
+# Static tripod talking-head shots read as flat/amateur on Reels compared to a
+# slow continuous push. `zoompan` applied to a VIDEO input (not a still) needs
+# d=1 (consume exactly one input frame per output frame — the default d=125
+# is for holding a single photo) and must be driven by 'on' (the running
+# output-frame counter) rather than a per-call increment, else the zoom level
+# resets every filter re-init. x/y re-center on every frame so the crop stays
+# frame-centered as zoom grows.
+
+
+def build_zoom_filter(
+    direction: str,
+    duration: float,
+    fps: int,
+    out_w: int,
+    out_h: int,
+    z_from: float = 1.0,
+    z_to: float = 1.10,
+) -> str:
+    """Build a zoompan filter string for a slow push in/out over `duration`.
+
+    direction: "in" (z_from -> z_to, e.g. 1.0 -> 1.10) or "out" (reversed).
+    out_w/out_h must match the frame size AFTER the preceding scale filter —
+    zoompan needs an explicit target size, it does not inherit input dims.
+    """
+    total_frames = max(1, round(duration * fps))
+    if direction == "out":
+        z_from, z_to = z_to, z_from
+    step = (z_to - z_from) / total_frames
+    z_expr = f"if(lte(on,1),{z_from:.5f},min(zoom+{step:.6f},{z_to:.5f}))" if direction != "out" \
+        else f"if(lte(on,1),{z_from:.5f},max(zoom-{abs(step):.6f},{z_to:.5f}))"
+    return (
+        f"zoompan=z='{z_expr}':d=1:"
+        f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+        f"s={out_w}x{out_h}:fps={fps}"
+    )
 
 
 # -------- Per-segment extraction (Rule 2 + Rule 3) --------------------------
@@ -157,6 +256,8 @@ def extract_segment(
     out_path: Path,
     preview: bool = False,
     draft: bool = False,
+    voice_chain: bool = False,
+    zoom: dict | None = None,
 ) -> None:
     """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
 
@@ -167,14 +268,25 @@ def extract_segment(
       - final (default): 1080p libx264 fast CRF 20
       - preview:         1080p libx264 medium CRF 22 (evaluable for QC)
       - draft:           720p libx264 ultrafast CRF 28 (cut-point check only)
+
+    `voice_chain=True` runs a per-clip mic-polish pass (highpass -> gentle
+    multiband-ish compression -> light denoise) before the edge fades, for
+    takes whose recorded level is inconsistent within themselves (see
+    metodologia/playbooks/edicao-video.md item 3).
+
+    `zoom={"direction": "in"|"out", "from": 1.0, "to": 1.10}` bakes a slow
+    Ken Burns push into the segment (see build_zoom_filter) — static tripod
+    talking-head shots read as flat without it. Omit for B-roll/handheld
+    shots that already carry their own camera movement.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     portrait = is_portrait_source(source)
-    if draft:
-        scale = "scale=-2:1280" if portrait else "scale=1280:-2"
+    target_dim = 1280 if draft else 1920
+    if portrait:
+        scale = f"scale=-2:{target_dim}"
     else:
-        scale = "scale=-2:1920" if portrait else "scale=1920:-2"
+        scale = f"scale={target_dim}:-2"
 
     vf_parts: list[str] = []
     if is_hdr_source(source):
@@ -182,11 +294,53 @@ def extract_segment(
     vf_parts.append(scale)
     if grade_filter:
         vf_parts.append(grade_filter)
+    if zoom:
+        src_w, src_h = get_video_dims(source)
+        if portrait:
+            out_w = round((src_w * target_dim / src_h) / 2) * 2
+            out_h = target_dim
+        else:
+            out_w = target_dim
+            out_h = round((src_h * target_dim / src_w) / 2) * 2
+        vf_parts.append(build_zoom_filter(
+            zoom.get("direction", "in"), duration, fps=24,
+            out_w=out_w, out_h=out_h,
+            z_from=float(zoom.get("from", 1.0)), z_to=float(zoom.get("to", 1.10)),
+        ))
     vf = ",".join(vf_parts)
 
     # 30ms audio fades at both edges (Rule 3) — prevent pops
     fade_out_start = max(0.0, duration - 0.03)
-    af = f"afade=t=in:st=0:d=0.03,afade=t=out:st={fade_out_start:.3f}:d=0.03"
+    fade_parts = [f"afade=t=in:st=0:d=0.03", f"afade=t=out:st={fade_out_start:.3f}:d=0.03"]
+
+    if voice_chain:
+        # Real chain, replicated from the Premiere reference (lapela mic):
+        # Multiband Compressor (Broadcast preset) -> Parametric EQ (Vocal
+        # Enhancer) -> DeNoise. See metodologia/playbooks/edicao-video.md #3.
+        # ffmpeg has no single "multiband compressor" filter -- acrossover
+        # splits into the same 4 bands (137/1147/6910Hz crossovers) as the
+        # Premiere preset, each band gets its own acompressor, then amix
+        # recombines and alimiter mirrors the reference's -5dB final limiter.
+        eq_chain = (
+            "highpass=f=80,"
+            "equalizer=f=110:width_type=q:width=1:g=6,"
+            "equalizer=f=291:width_type=q:width=1:g=-3,"
+            "treble=g=14:f=17500:width_type=h:width=3000"
+        )
+        fade_chain = ",".join(fade_parts)
+        af_complex = (
+            f"[0:a]{eq_chain}[apre];"
+            f"[apre]acrossover=split=137 1147 6910[b0][b1][b2][b3];"
+            f"[b0]acompressor=threshold=-20dB:ratio=2.5:attack=1:release=100[c0];"
+            f"[b1]acompressor=threshold=-21dB:ratio=2.5:attack=1:release=100[c1];"
+            f"[b2]acompressor=threshold=-22dB:ratio=2.5:attack=1:release=100[c2];"
+            f"[b3]acompressor=threshold=-23dB:ratio=2.5:attack=1:release=100[c3];"
+            f"[c0][c1][c2][c3]amix=inputs=4:normalize=0[mb];"
+            f"[mb]alimiter=limit=0.562[lim];"
+            f"[lim]afftdn=nr=8:nf=-40,{fade_chain}[aout]"
+        )
+    else:
+        af_complex = f"[0:a]{','.join(fade_parts)}[aout]"
 
     if draft:
         preset, crf = "ultrafast", "28"
@@ -195,13 +349,14 @@ def extract_segment(
     else:
         preset, crf = "fast", "20"
 
+    filter_complex = f"[0:v]{vf}[vout];{af_complex}"
     cmd = [
         "ffmpeg", "-y",
         "-ss", f"{seg_start:.3f}",
         "-i", str(source),
         "-t", f"{duration:.3f}",
-        "-vf", vf,
-        "-af", af,
+        "-filter_complex", filter_complex,
+        "-map", "[vout]", "-map", "[aout]",
         "-c:v", "libx264", "-preset", preset, "-crf", crf,
         "-pix_fmt", "yuv420p", "-r", "24",
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
@@ -209,6 +364,12 @@ def extract_segment(
         str(out_path),
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+
+def _has_voice_chain(r: dict, edl: dict) -> bool:
+    if "voice_chain" in r:
+        return bool(r["voice_chain"])
+    return bool(edl.get("voice_chain"))
 
 
 def extract_all_segments(
@@ -252,10 +413,14 @@ def extract_all_segments(
             seg_filter = resolved
 
         note = r.get("beat") or r.get("note") or ""
-        print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}")
+        vchain = _has_voice_chain(r, edl)
+        zoom = r.get("zoom")
+        print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}"
+              + ("  [voice-chain]" if vchain else "")
+              + (f"  [zoom {zoom['direction']} {zoom.get('from',1.0)}->{zoom.get('to',1.10)}]" if zoom else ""))
         if is_auto:
             print(f"        grade: {seg_filter or '(none)'}")
-        extract_segment(src_path, start, duration, seg_filter, out_path, preview=preview, draft=draft)
+        extract_segment(src_path, start, duration, seg_filter, out_path, preview=preview, draft=draft, voice_chain=vchain, zoom=zoom)
         seg_paths.append(out_path)
 
     return seg_paths
@@ -268,7 +433,7 @@ def concat_segments(segment_paths: list[Path], out_path: Path, edit_dir: Path) -
     """Lossless concat via the concat demuxer. No re-encode."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     concat_list = edit_dir / "_concat.txt"
-    concat_list.write_text("".join(f"file '{p.resolve()}'\n" for p in segment_paths))
+    concat_list.write_text("".join(f"file '{p.resolve()}'\n" for p in segment_paths), encoding="utf-8")
 
     cmd = [
         "ffmpeg", "-y",
@@ -337,7 +502,7 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
             seg_offset += seg_duration
             continue
 
-        transcript = json.loads(tr_path.read_text())
+        transcript = json.loads(tr_path.read_text(encoding="utf-8"))
         words_in_seg = _words_in_range(transcript, seg_start, seg_end)
 
         # Group into 2-word chunks, break on punctuation
@@ -380,16 +545,19 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
         lines.append(f"{_srt_timestamp(a)} --> {_srt_timestamp(b)}")
         lines.append(t)
         lines.append("")
-    out_path.write_text("\n".join(lines))
-    print(f"master SRT → {out_path.name} ({len(entries)} cues)")
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"master SRT -> {out_path.name} ({len(entries)} cues)")
 
 
 # -------- Loudness normalization (social-ready audio) -----------------------
 
 
-# Social-media standard: -14 LUFS integrated, -1 dBTP peak, LRA 11 LU.
-# Matches YouTube / Instagram / TikTok / X / LinkedIn normalization targets.
-LOUDNORM_I = -14.0
+# Target: -16 LUFS integrated, -1 dBTP peak, LRA 11 LU.
+# House style do Augusto (confirmado 2026-07-20): os cortes dele no Premiere
+# entregam -18 a -23 LUFS, mais baixo que o padrão de plataforma (-14). -16 é o
+# meio-termo escolhido — sentar dentro do range dele sem ficar baixo demais pra
+# conteúdo que pode virar anúncio. Ver metodologia/playbooks/edicao-video.md.
+LOUDNORM_I = -16.0
 LOUDNORM_TP = -1.0
 LOUDNORM_LRA = 11.0
 
@@ -499,6 +667,7 @@ def build_final_composite(
     subtitles_path: Path | None,
     out_path: Path,
     edit_dir: Path,
+    subtitle_style: str = SUB_FORCE_STYLE,
 ) -> None:
     """Final pass: base → overlays (PTS-shifted) → subtitles LAST → out.
 
@@ -537,9 +706,17 @@ def build_final_composite(
 
     # Subtitles LAST — Rule 1
     if has_subs:
-        subs_abs = str(subtitles_path.resolve()).replace(":", r"\:").replace("'", r"\'")
+        # ffmpeg's filtergraph parser treats backslash as an escape char, which
+        # collides with Windows path separators — normalize to forward slashes
+        # before escaping the drive-letter colon and any quotes.
+        subs_abs = (
+            str(subtitles_path.resolve())
+            .replace("\\", "/")
+            .replace(":", r"\:")
+            .replace("'", r"\'")
+        )
         filter_parts.append(
-            f"{current}subtitles='{subs_abs}':force_style='{SUB_FORCE_STYLE}'[outv]"
+            f"{current}subtitles='{subs_abs}':force_style='{subtitle_style}'[outv]"
         )
         out_label = "[outv]"
     else:
@@ -566,6 +743,54 @@ def build_final_composite(
     ]
     print(f"compositing → {out_path.name}")
     print(f"  overlays: {len(overlays)}, subtitles: {'yes' if has_subs else 'no'}")
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+
+# -------- Music bed (playbook item 2) ----------------------------------------
+
+
+def mix_music_bed(
+    video_path: Path,
+    music_path: Path,
+    out_path: Path,
+    gain_db: float = -18.0,
+    notch_freq: float = 1400.0,
+    notch_gain: float = -15.0,
+    notch_width: float = 700.0,
+) -> None:
+    """Mix a constant music bed under the whole video (covers cut gaps too).
+
+    Reference values (metodologia/playbooks/edicao-video.md #2): notch the
+    music's EQ in the voice-presence range (~1.4kHz, ~-15dB, ~700Hz wide) so
+    it doesn't fight the voice, then drop the track well below the voice
+    (-15 to -20dB) rather than auto-ducking. Track choice is always manual —
+    `music_path` must be supplied by the caller, never auto-selected.
+    """
+    dur_out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=nw=1:nk=1", str(video_path)],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    duration = float(dur_out)
+
+    filter_complex = (
+        f"[1:a]atrim=0:{duration:.3f},"
+        f"equalizer=f={notch_freq}:width_type=h:width={notch_width}:g={notch_gain},"
+        f"volume={gain_db}dB[music];"
+        f"[0:a][music]amix=inputs=2:duration=first:normalize=0[aout]"
+    )
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(video_path),
+        "-i", str(music_path),
+        "-filter_complex", filter_complex,
+        "-map", "0:v", "-map", "[aout]",
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        "-movflags", "+faststart",
+        str(out_path),
+    ]
+    print(f"  music bed ({music_path.name}, {gain_db}dB, notch {notch_freq}Hz) → {out_path.name}")
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
@@ -599,7 +824,7 @@ def main() -> None:
     ap.add_argument(
         "--no-loudnorm",
         action="store_true",
-        help="Skip audio loudness normalization. Default is on (-14 LUFS, -1 dBTP, LRA 11).",
+        help="Skip audio loudness normalization. Default is on (-16 LUFS, -1 dBTP, LRA 11).",
     )
     args = ap.parse_args()
 
@@ -640,14 +865,36 @@ def main() -> None:
 
     # 4. Composite (overlays + subtitles LAST) → intermediate (pre-loudnorm) path
     overlays = edl.get("overlays") or []
+    subtitle_style = edl.get("subtitle_style") or SUB_FORCE_STYLE
+    tmp_composite = out_path.with_suffix(".prenorm.mp4")
+    build_final_composite(
+        base_path, overlays, subs_path, tmp_composite, edit_dir,
+        subtitle_style=subtitle_style,
+    )
+
+    # 4b. Music bed — mixed in before loudnorm so the final pass measures the
+    # true combined (voice + music) loudness, not just the voice.
+    music = edl.get("music")
+    if music:
+        music_path = resolve_path(music["file"], edit_dir)
+        if music_path.exists():
+            tmp_music = out_path.with_suffix(".premusic.mp4")
+            tmp_composite.rename(tmp_music)
+            mix_music_bed(
+                tmp_music, music_path, tmp_composite,
+                gain_db=float(music.get("gain_db", -18.0)),
+                notch_freq=float(music.get("notch_freq", 1400.0)),
+                notch_gain=float(music.get("notch_gain", -15.0)),
+                notch_width=float(music.get("notch_width", 700.0)),
+            )
+            tmp_music.unlink(missing_ok=True)
+        else:
+            print(f"warning: music path in EDL does not exist: {music_path}")
+
     if args.no_loudnorm:
-        # Composite directly to final output
-        build_final_composite(base_path, overlays, subs_path, out_path, edit_dir)
+        tmp_composite.rename(out_path)
     else:
-        # Composite to a temp file, then run loudnorm → final output
-        tmp_composite = out_path.with_suffix(".prenorm.mp4")
-        build_final_composite(base_path, overlays, subs_path, tmp_composite, edit_dir)
-        print("loudness normalization → social-ready (-14 LUFS / -1 dBTP / LRA 11)")
+        print("loudness normalization → -16 LUFS / -1 dBTP / LRA 11")
         apply_loudnorm_two_pass(tmp_composite, out_path, preview=args.draft)
         tmp_composite.unlink(missing_ok=True)
 

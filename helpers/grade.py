@@ -97,8 +97,12 @@ def _sample_frame_stats(
     # Sample fps = n_samples / duration, clamped so we don't over-sample short clips
     fps = max(0.5, min(n_samples / max(duration, 0.1), 10.0))
 
-    with tempfile.NamedTemporaryFile(mode="w+", suffix=".txt", delete=False) as f:
-        metadata_path = f.name
+    # ffmpeg filter option syntax uses ':' as a key=value separator, which
+    # collides with an absolute Windows path's drive-letter colon (C:\...).
+    # Simplest robust fix: write the metadata file with a plain relative name
+    # in the CURRENT directory (no colons, no backslashes to escape at all)
+    # instead of fighting the filtergraph escaping rules.
+    metadata_path = f".grade_stats_{next(tempfile._get_candidate_names())}.txt"
 
     try:
         cmd = [
@@ -109,7 +113,7 @@ def _sample_frame_stats(
             "-vf", f"fps={fps:.2f},signalstats,metadata=print:file={metadata_path}",
             "-f", "null", "-",
         ]
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
         # Parse signalstats metadata. Signalstats reports values in the NATIVE
         # bit depth of the decoded frame (8-bit → 0-255, 10-bit → 0-1023). We

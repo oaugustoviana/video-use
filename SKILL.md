@@ -59,10 +59,11 @@ The skill lives in `video-use/`. User footage lives wherever they put it. All se
 
 First-time install lives in `install.md` (clone, deps, ffmpeg, skill registration, API key). Don't re-run it every session; on cold start just verify:
 
-- `ELEVENLABS_API_KEY` resolves — either in the environment or in `.env` at the video-use repo root. If missing, ask the user to paste one and write it to `.env` (never to the user's `<videos_dir>`).
+- Transcription runs locally via WhisperX (`helpers/transcribe.py`), not ElevenLabs. No API key required for basic transcription.
+- `HF_TOKEN` (Hugging Face token) in `.env` at the video-use repo root is OPTIONAL, only needed for speaker diarization (multi-speaker sources, e.g. interviews). Single-speaker talking-head sources do not need it. If diarization is requested and the token is missing, ask the user to paste one and write it to `.env` (never to the user's `<videos_dir>`).
 - `ffmpeg` + `ffprobe` on PATH.
-- Python deps installed (`uv sync` or `pip install -e .` inside the repo).
-- Node.js + npm available if the session needs HyperFrames or Remotion slots. HyperFrames currently requires Node.js 22+.
+- Python deps installed (`uv sync` or `pip install -e .` inside the repo), including `whisperx`.
+- Node.js + npm available if the session needs HyperFrames or Remotion slots. HyperFrames currently requires Node.js 22+. **Installed on this machine as of 2026-07-08** (Node v24.18.0 via winget, `OpenJS.NodeJS.LTS`). Not on PATH in fresh Bash shells until the shell restarts — prefix commands with `export PATH="/c/Program Files/nodejs:$PATH"` if `node`/`npm`/`npx` aren't found. HyperFrames CLI confirmed working (`npx --yes hyperframes ...`), no account needed for local render — `hyperframes auth` is only for optional HeyGen cloud rendering.
 - `yt-dlp`, HyperFrames, Remotion, Manim installed only on first use.
 - First-use animation setup happens inside the slot directory, never at the video-use repo root. HyperFrames can be invoked with `npx --yes hyperframes ...`; Remotion can be scaffolded with `npx create-video@latest` or installed as a project-local dependency before using its `remotion render` command.
 - This skill vendors `skills/manim-video/`. Read its SKILL.md when building a Manim slot.
@@ -71,12 +72,13 @@ Helpers (`helpers/transcribe.py`, `helpers/render.py`, etc.) live alongside this
 
 ## Helpers
 
-- **`transcribe.py <video>`** — single-file Scribe call. `--num-speakers N` optional. Cached.
-- **`transcribe_batch.py <videos_dir>`** — 4-worker parallel transcription. Use for multi-take.
+- **`transcribe.py <video>`** — single-file local WhisperX transcription (default model `small`, language `pt`, CPU on this machine). `--num-speakers N` and diarization optional (needs `HF_TOKEN`). Cached.
+- **`transcribe_batch.py <videos_dir>`** — batch transcription, default 1 worker (sequential; this machine's 2GB GPU/mobile CPU don't benefit from parallel local model instances). Use for multi-take.
 - **`pack_transcripts.py --edit-dir <dir>`** — `transcripts/*.json` → `takes_packed.md` (phrase-level, break on silence ≥ 0.5s).
 - **`timeline_view.py <video> <start> <end>`** — filmstrip + waveform PNG. On-demand visual drill-down. **Not a scan tool** — use it at decision points, not constantly.
 - **`render.py <edl.json> -o <out>`** — per-segment extract → concat → overlays (PTS-shifted) → subtitles LAST. `--preview` for 720p fast. `--build-subtitles` to generate master.srt inline.
 - **`grade.py <in> -o <out>`** — ffmpeg filter chain grade. Presets + `--filter '<raw>'` for custom.
+- **`export_premiere.py <edl.json> -o <out.xml> [--name "..."]`** — exports the `edl.json` cut decisions as a gapless FCP7 XML (xmeml v5) timeline that imports into **Adobe Premiere Pro** (File > Import) and DaVinci Resolve (File > Import > Timeline). Multi-source aware (each range keeps its own camera/file, so multi-cam edits survive the round trip). Probes each source with `ffprobe` for fps/resolution/samplerate; handles NTSC rates. **Non-destructive handoff**: the timeline references the ORIGINAL clips, so the editor keeps every trim available in Premiere. Use this instead of `render.py` when the user wants to finish/adjust the cut in Premiere themselves rather than receive a baked MP4 (Augusto's default for interviews). Only a `sources` + `ranges` edl is needed — grade/overlays/subtitles are ignored (those live in Premiere after import).
 
 For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a sub-agent via the `Agent` tool.
 
@@ -98,6 +100,10 @@ For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a su
 
    If anything fails: fix → re-render → re-eval. **Cap at 3 self-eval passes** — if issues remain after 3, flag them to the user rather than looping forever. Only present the preview once the self-eval passes.
 8. **Iterate + persist.** Natural-language feedback, re-plan, re-render. Never re-transcribe. Final render on confirmation. Append to `project.md`.
+
+**Delivery fork.** Two ways to hand off the finished cut, decided by what the user wants to do next:
+- **Baked MP4** (`render.py`) — when they want a final video to publish/send.
+- **Premiere timeline** (`export_premiere.py`) — when they want to *finish or fine-tune the cut themselves* in Premiere. This is the interview/rough-cut path: you make the hard-cut decisions (retakes out, false starts caught, gaps closed), export the XML, and they open it in Premiere with every original clip still trimmable. Skip the self-eval render loop here — the human is the next pass. You can also do both.
 
 ## Cut craft (techniques)
 

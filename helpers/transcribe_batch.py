@@ -1,13 +1,18 @@
-"""Batch-transcribe every video in a directory with 4 parallel workers.
+"""Batch-transcribe every video in a directory locally with WhisperX.
 
-Walks <videos_dir> for common video extensions, runs ElevenLabs Scribe on
-each, writes transcripts to <videos_dir>/edit/transcripts/<name>.json.
+Walks <videos_dir> for common video extensions, transcribes each with the
+local WhisperX model (see transcribe.py), writes transcripts to
+<videos_dir>/edit/transcripts/<name>.json.
 
 Cached per-file: any source that already has a transcript is skipped.
 
+Default is 1 worker (sequential): this machine has a 2GB GPU and a mobile
+CPU, running multiple WhisperX model instances in parallel would contend for
+the same limited memory rather than actually speeding things up.
+
 Usage:
     python helpers/transcribe_batch.py <videos_dir>
-    python helpers/transcribe_batch.py <videos_dir> --workers 4
+    python helpers/transcribe_batch.py <videos_dir> --workers 1
     python helpers/transcribe_batch.py <videos_dir> --num-speakers 2
     python helpers/transcribe_batch.py <videos_dir> --edit-dir /custom/edit
 """
@@ -43,7 +48,7 @@ def main() -> None:
         default=None,
         help="Edit output directory (default: <videos_dir>/edit)",
     )
-    ap.add_argument("--workers", type=int, default=4, help="Parallel workers (default: 4)")
+    ap.add_argument("--workers", type=int, default=1, help="Parallel workers (default: 1, see module docstring)")
     ap.add_argument(
         "--language",
         type=str,
