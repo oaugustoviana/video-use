@@ -63,9 +63,9 @@ First-time install lives in `install.md` (clone, deps, ffmpeg, skill registratio
 - `HF_TOKEN` (Hugging Face token) in `.env` at the video-use repo root is OPTIONAL, only needed for speaker diarization (multi-speaker sources, e.g. interviews). Single-speaker talking-head sources do not need it. If diarization is requested and the token is missing, ask the user to paste one and write it to `.env` (never to the user's `<videos_dir>`).
 - `ffmpeg` + `ffprobe` on PATH.
 - Python deps installed (`uv sync` or `pip install -e .` inside the repo), including `whisperx`.
-- Node.js + npm available if the session needs HyperFrames or Remotion slots. HyperFrames currently requires Node.js 22+. **Installed on this machine as of 2026-07-08** (Node v24.18.0 via winget, `OpenJS.NodeJS.LTS`). Not on PATH in fresh Bash shells until the shell restarts — prefix commands with `export PATH="/c/Program Files/nodejs:$PATH"` if `node`/`npm`/`npx` aren't found. HyperFrames CLI confirmed working (`npx --yes hyperframes ...`), no account needed for local render — `hyperframes auth` is only for optional HeyGen cloud rendering.
-- `yt-dlp`, HyperFrames, Remotion, Manim installed only on first use.
-- First-use animation setup happens inside the slot directory, never at the video-use repo root. HyperFrames can be invoked with `npx --yes hyperframes ...`; Remotion can be scaffolded with `npx create-video@latest` or installed as a project-local dependency before using its `remotion render` command.
+- Node.js + npm available if the session needs Remotion slots. **Installed on this machine as of 2026-07-08** (Node v24.18.0 via winget, `OpenJS.NodeJS.LTS`). Not on PATH in fresh Bash shells until the shell restarts — prefix commands with `export PATH="/c/Program Files/nodejs:$PATH"` if `node`/`npm`/`npx` aren't found. Remotion is the animation engine (HyperFrames removed 2026-09-26).
+- `yt-dlp`, Remotion, Manim installed only on first use.
+- First-use animation setup happens inside the slot directory, never at the video-use repo root. Remotion can be scaffolded with `npx create-video@latest` or installed as a project-local dependency before using its `remotion render` command.
 - This skill vendors `skills/manim-video/`. Read its SKILL.md when building a Manim slot.
 
 Helpers (`helpers/transcribe.py`, `helpers/render.py`, etc.) live alongside this SKILL.md. Resolve their paths relative to the directory containing this file — the skill is typically symlinked at `~/.claude/skills/video-use/` or `~/.codex/skills/video-use/`.
@@ -206,18 +206,15 @@ Animations match the content and the brand. **Get the palette, font, and visual 
 
 **Tool options:**
 
-Pick the engine per animation slot. Do not default to Remotion just because the animation is web-adjacent.
+**Camada do Augusto (26/09/2026): Remotion é o motor padrão de animação e legenda animada.** HyperFrames foi removido desta máquina, não usar nem instalar. Pra Remotion, seguir as skills `remotion-*` (`remotion-best-practices` é o roteador; legenda em `remotion-captions`).
 
-- **HyperFrames** — Browser-native HTML/CSS/GSAP video compositions: product UI motion, website-to-video or mockup-to-video captures, kinetic typography, landing-page/storyboard promos, data-driven UI states, transparent WebM overlays, and clips that need deterministic frame capture plus HyperFrames lint/validate/render checks. Best when the animation should be authored and verified like a web composition instead of a React component tree.
-- **Remotion** — React/CSS compositions with component state, reusable React primitives, or an existing Remotion brand system. Best when the user specifically asks for React/Remotion or when React composition is the simpler authoring model.
+- **Remotion** — default engine. React/CSS compositions: kinetic typography, animated captions, overlays (render with alpha when needed: ProRes 4444 or WebM VP9), UI motion, data-driven states.
 - **Manim** — formal diagrams, state machines, equation derivations, graph morphs. Read `skills/manim-video/SKILL.md` and its references for depth.
 - **PIL + PNG sequence + ffmpeg** — simple overlay cards: counters, typewriter text, single bar reveals, progressive draws. Fast to iterate, any aesthetic you want. The launch video used this.
 
-For HyperFrames slots, scaffold the slot inside `edit/animations/slot_<id>/` with `npx --yes hyperframes init . --example blank --non-interactive --skip-skills`, build the HTML composition there, run the HyperFrames checks that fit the slot (`lint`, `validate`, and a draft render when practical), then produce the final overlay video with `npx --yes hyperframes render . -o render.mp4` or `--format webm -o render.webm` when alpha is required. Point the EDL overlay `file` at the actual rendered path.
+For Remotion slots, keep the Remotion project isolated inside `edit/animations/slot_<id>/`, scaffold with `npx create-video@latest --yes --blank --no-tailwind .` or install Remotion locally there, render the composition to `render.mp4` (or `render.mov` ProRes 4444 / `render.webm` when alpha is required) with the project-local `remotion render` command, and verify duration and dimensions with `ffprobe`. Point the EDL overlay `file` at the actual rendered path.
 
-For Remotion slots, keep the Remotion project isolated inside the same slot directory, scaffold with `npx create-video@latest` or install Remotion locally there, render the composition to `render.mp4` with the project-local `remotion render` command, and verify duration and dimensions with `ffprobe`.
-
-None is mandatory. Invent hybrids if useful (e.g., PIL background with a HyperFrames or Remotion layer on top).
+None is mandatory. Invent hybrids if useful (e.g., PIL background with a Remotion layer on top).
 
 **Duration rules of thumb, context-dependent:**
 
